@@ -1,11 +1,11 @@
 # Roku plugin for HomeVision - Ron Boston
 # Version 1.0
-# $Revision: 1.11 $
-# $Date: 2022/01/09 05:18:53 $
+# $Revision: 1.12 $
+# $Date: 2022/01/09 07:06:00 $
 
 hvImport debug
 
-set version {$Id: roku.hap,v 1.11 2022/01/09 05:18:53 ron Exp $}
+set version {$Id: roku.hap,v 1.12 2022/01/09 07:06:00 ron Exp $}
 debug "$version" blue
 
 
@@ -22,7 +22,7 @@ array set cfg {
     discover 1
     geometry  ""
     listWidths {0 0 0}
-    mqtttopic ""
+    mqtttopic "<roku>"
 }
 
 set currentItem ""
@@ -248,11 +248,11 @@ proc readdata {f} {
             set current "activeapp"
         } elseif {$line eq "</apps>"} {
             createDevList
-            mqttComm -exactstat -nodim stat <$cfg(mqtttopic)> [getJSON apps]
+            mqttComm -exactstat -nodim stat $cfg(mqtttopic) [getJSON apps]
             set current ""
         } elseif {$line eq "</active-app>"} {
             set current ""
-            mqttComm -exactstat -nodim stat <$cfg(mqtttopic)> [getJSON active-app]
+            mqttComm -exactstat -nodim stat $cfg(mqtttopic) [getJSON active-app]
         } elseif {[regexp {<app ?(.*)>(.*)</app>} $line --> attr app]} {
             set attr [string map {= " "} $attr]
             set app [string map {&amp; &} $app]
@@ -738,7 +738,7 @@ proc subscribe {{type sub}} {
     debug "subscribe: $type" blue
     if {$type ni {sub unsub}} {return}
 
-    mqttComm $type <$cfg(mqtttopic)> rokucb
+    mqttComm $type $cfg(mqtttopic) rokucb
 }
 
 
