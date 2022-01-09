@@ -1,0 +1,765 @@
+# Roku plugin for HomeVision - Ron Boston
+# Version 1.0
+# $Revision: 1.11 $
+# $Date: 2022/01/09 05:18:53 $
+
+hvImport debug
+
+set version {$Id: roku.hap,v 1.11 2022/01/09 05:18:53 ron Exp $}
+debug "$version" blue
+
+
+tcl::tm::path add [file dirname [info script]]
+
+package require udp
+
+array set cfg {
+    rokuIP   "192.168.123.169"
+    rokuPort 8060
+    serPre "roku:"
+    serPost ";"
+    netioType "roku"
+    discover 1
+    geometry  ""
+    listWidths {0 0 0}
+    mqtttopic ""
+}
+
+set currentItem ""
+set current ""
+set sockChan ""
+set udpChan ""
+set refresh 300
+
+set keys {
+    Home
+    Rev
+    Fwd
+    Play
+    Select
+    Left
+    Right
+    Down
+    Up
+    Back
+    InstantReplay
+    Info
+    Backspace
+    Search
+    Enter
+    FindRemote
+    VolumeDown
+    VolumeMute
+    VolumeUp
+    PowerOff
+    ChannelUp
+    ChannelDown
+    InputTuner
+    InputHDMI1
+    InputHDMI2
+    InputHDMI3
+    InputHDMI4
+    InputAV1
+  }
+
+set queries {
+    apps
+    active-app
+    media-player
+    device-info
+    icon
+    tv-channels
+    tv-active-channel
+}
+# M-Search to find Roku ip/port
+
+# IANA assigned UPnP multicast address and port
+set mcastaddr 239.255.255.250
+set mcastport 1900
+set apiversion 1.15.0
+
+proc start_search {} {
+    global udpChan
+    global mcastaddr mcastport  serverport
+    # The reuse option will allow multiple apps to listen on the same UDP port.
+    if {[catch {udp_open $mcastport reuse} result]} {
+        # Some other UPnP application has already claimed the ssdp port
+        debug "can't open ssdp port" $result $::errorCode
+    }
+    set udpChan $result
+    # Join the multicast group
+    fconfigure $udpChan -mcastadd $mcastaddr -remote [list $mcastaddr $mcastport]
+    # Using "-buffering none" has the undesired side-effect that the implied
+    # newline of the puts command gets sent in a separate UDP package.
+    fconfigure $udpChan -blocking 0 -translation {auto crlf} -mcastloop 1
+    fileevent $udpChan readable [list receive]
+
+    # Send a M-Search Message for Roku device
+    set msg {M-SEARCH * HTTP/1.1}
+    append msg \n "Host: 239.255.255.250:1900" \n
+    append msg {Man: "ssdp:discover"} \n "ST: roku:ecp" \n
+    debug "$msg" red
+    puts $udpChan $msg
+    flush $udpChan
+}
+
+proc receive {} {
+    global udpChan refresh cfg
+    
+    set data [read $udpChan]
+    # Discard false triggers
+    if {$data eq ""} return
+    set peer [fconfigure $udpChan -peer]
+    try {
+        # Bail out early on messages that can't be M-SEARCH responses.
+        set ldata [split $data \n]
+        if {![string equal [lindex $ldata 0] "HTTP/1.1 200 OK"]} return
+        set hdr [headers $ldata]
+        if {![dict exists $hdr st] || ![dict exists $hdr location]} return
+        if {"roku:ecp" ni [dict get $hdr st]} return
+        if {[regexp {http://([0-9\.]+):([0-9]+)/*} [dict get $hdr location] --> ip port]} {
+            debug "ip,port: $ip,$port"
+            if {$cfg(discover)} {
+                set cfg(rokuIP) $ip
+                set cfg(rokuPort) $port
+            }
+        }
+        if {[dict exists $hdr cache-control]} {
+            set time [lindex [split [dict get $hdr cache-control] '='] 1]
+            if {$time < $refresh} {
+                set time $refresh
+            }
+        } else {
+            set time $refresh
+        }
+        after cancel start_search
+        after [expr {$time * 1000}] start_search
+
+        if {[catch {close $udpChan} result]} {
+            debug "close error: $result" red
+        }
+    } on return - {
+        debug "\n$peer\n$data" blue
+    }
+}
+
+proc headers {data} {
+    set rc {}
+    foreach line $data {
+        if {[regexp {^([^][()<>@,;:\\""/?={}\s]+):\s*(.*)} \
+            [string trimright $line] -> name value]} {
+            dict set rc [string tolower $name] $value
+            debug "name:value: $name,$value" blue
+        }
+    }
+    return $rc
+}
+
+# End M-Search section
+
+# Start Roku Communication section
+
+# Set up socket to Roku
+proc startclient {} {
+    global cfg sockChan
+
+    catch {close $sockChan}
+    if {$cfg(rokuIP) eq "" || $cfg(rokuPort) eq ""} {
+        debug "Roku ip and/or port not set" red
+        return
+    }
+    debug "(Re)starting Client" blue
+    if {[catch {socket $cfg(rokuIP) $cfg(rokuPort)} sockChan]} {
+        debug "*** Client FAILED ***: $sockChan" red
+        return
+    }
+    fconfigure $sockChan -blocking 0
+    debug "Client Started: $sockChan" darkslategray
+    fileevent $sockChan readable [list readdata $sockChan]
+}
+
+# Send command through socket
+proc sendCmd {cmd} {
+    global sockChan
+    
+    startclient
+    debug "$sockChan: $cmd" darkred
+    if {[catch {puts $sockChan $cmd} result]} {
+        debug "Write error: $result" red
+    }
+    if {[catch {flush $sockChan} result]} {
+        debug "flush error $result" red
+    }
+}
+
+# Create command to send
+proc processCmd {cmd} {
+    global keys queries
+
+    set data "POST "
+    debug "cmd:$cmd" red
+    if {[string first / $cmd] == 0} {
+       set type $cmd
+    } elseif {[string first / $cmd] > 0} {
+       set type "/$cmd"
+    } elseif {$cmd in $keys} {
+       set type "/keypress/$cmd"
+    } elseif {[string is digit -strict $cmd]} {
+       set type "/launch/$cmd"
+    } elseif {$cmd in $queries} {
+        set type "/query/[join $cmd "/"]"
+        # send a stat after some time
+    } else {
+        return
+    }
+debug "cmd;$cmd;type:$type;" green
+    if {[string first /query $type] == 0} {
+        set data "GET "
+    }
+    append data $type " HTTP/1.1" \n
+    append data "Content-Type: application/x-www-form-urlencoded" \n
+    append data "Content-Length: 0" \n
+    sendCmd $data
+}
+
+proc get_apps {type} {
+
+    set data "GET "
+    append data "/query/" "$type" " HTTP/1.1" \n
+    append data "Content-Type: application/x-www-form-urlencoded" \n
+    append data "Content-Length: 0" \n
+    sendCmd $data
+}
+
+# Read response
+proc readdata {f} {
+    global cfg apps ids dispactiveapp activeapp activeid current
+
+    set line ""
+    if {[eof $f] || [catch {gets $f line} result]} {
+        debug "no input" blue
+        close $f
+    } elseif {$result != -1} {
+        debug  "$line" green
+        set id 0
+        if {$line eq "<apps>"} {
+            set current "applist"
+        } elseif {$line eq "<active-app>"} {
+            set current "activeapp"
+        } elseif {$line eq "</apps>"} {
+            createDevList
+            mqttComm -exactstat -nodim stat <$cfg(mqtttopic)> [getJSON apps]
+            set current ""
+        } elseif {$line eq "</active-app>"} {
+            set current ""
+            mqttComm -exactstat -nodim stat <$cfg(mqtttopic)> [getJSON active-app]
+        } elseif {[regexp {<app ?(.*)>(.*)</app>} $line --> attr app]} {
+            set attr [string map {= " "} $attr]
+            set app [string map {&amp; &} $app]
+            set id ""
+            set type ""
+            set vers ""
+            if {[dict exists $attr id]} {
+                set id [dict get $attr id]
+            }
+            if {[dict exists $attr type]} {
+                set type [dict get $attr type]
+            }
+            if {[dict exists $attr version]} {
+                set vers [dict get $attr version]
+            }
+            if {$current eq "applist"} {
+                dict set apps $app id $id 
+                dict set apps $app type $type
+                dict set apps $app version $vers
+                if {$id ne ""} {
+                    dict set ids $id $app
+                }
+                debug "id:$id,type:$type,version:$vers,app:$app;" red
+            } elseif {$current eq "activeapp"} {
+                set activeapp $app
+                set activeid $id
+                set dispactiveapp $app
+                if {$id ne ""} {
+                    append dispactiveapp " - $id"
+                }
+                debug "id:$id,app:$app;" red
+            }
+        }
+    } else {
+        debug "Done"
+    }
+}
+
+proc getJSON {type} {
+    global apps ids activeapp activeid
+
+    if {$type eq "active-app"} {
+            if {$activeid ne ""} {
+                set id $activeid
+            } else {
+                set id "NULL"
+            }
+        set json "{\"active-app\":{\"app\":\"$activeapp\",\"id\":$id}}"
+
+    } elseif {$type eq "apps"} {
+        set json "{\"apps\":{" 
+        foreach a [dict keys $apps] {
+            if {[dict exists $apps $a id]} {
+                set id [dict get $apps $a id]
+            } else {
+                set id "NULL"
+            }
+            if {[dict exists $apps $a type]} {
+                set type [dict get $apps $a type]
+            } else {
+                set type ""
+            }
+            if {[dict exists $apps $a version]} {
+                set vers [dict get $apps $a version]
+            } else {
+                set vers ""
+            }
+            lappend aps "\"$a\":{\"id\":$id,\"type\":\"$type\",\"version\":\"$vers\"}"
+       
+        }
+        append json [join $aps ","] "}}"
+    }
+    debug $json
+    return $json
+}
+
+# netioaction is called by NetIO "netioaction" command.
+# Example: sends: netioaction roku {channel}
+# "roku" must match config's netioType.
+# "channel" must match any allowed channel.
+hvPublic netioaction
+proc netioaction {args} {
+    global cfg
+    
+    lassign $args type chan
+    if {$type ne $cfg(netioType)} {return ""}
+    if {$chan eq ""} {return ""}
+    processCmd $chan
+    after cancel {processCmd "active-app"}
+    after 3000 {processCmd "active-app"}
+
+}
+
+# netio is called by NetIO "get" command.
+# Example: reads: get roku state 0 {value}
+# "roku" must match config's netioType.
+# "state" is a don't care, but something must be present.
+# "0" is a don't care, but something must be present.
+# "value" is the name of the info to be returned.
+# Note: Not yet implemented to return anything useful.
+hvPublic netio
+proc netio {type args} {
+    global cfg
+    
+    if {$type ne $cfg(netioType)} {return ""}
+    # Can't get anything from the Roku yet, return "unknown" for now
+    return "Unknown item $args"
+}
+
+# Serial string to trigger sending keys
+# Example: Roku: key_volup;
+# "Roku:" should be config's serPre (serial Prefix string).
+# ";" should be config's serPost (serial terminator character(s)).
+# A single space must follow serPre and precede the key string.
+proc rokuserial {data} {
+    global cfg
+    
+    debug "serial: $data" red
+    set fmt "$cfg(serPre) (\\w+)$cfg(serPost)"
+    if {![regexp -nocase $fmt $data match chan]} {
+        return 0
+    } elseif {$chan eq ""} {
+        return -1
+    } else {
+        processCmd $chan]=
+        after cancel {processCmd "active-app"}
+        after 3000 {processCmd "active-app"}
+        return [string length $match]
+    }
+}
+
+# Get the config info from cfg file
+proc loadconfig {} {
+    global cfgfile cfg
+    
+    package require Mk4tcl
+
+    set suffix [hvVariable ApplicationSuffix]
+    if {$suffix eq ""} {
+        set cfgfile roku.cfg
+    } else {
+        set cfgfile roku-$suffix.cfg
+    }
+    mk::file open cfg
+    if {![catch {hvConfigFile open $cfgfile} f]} {
+        mk::file load cfg $f
+        close $f
+    }
+    # General settings
+    mk::view layout cfg.main {
+        name value
+    }
+    # update config
+    mk::loop row cfg.main {
+        array set cfg [mk::get $row name value]
+    }
+}
+
+# Save config changes to cfg file
+proc saveconfig {{top ""}} {
+    global cfg cfgfile
+    
+    if {[winfo exists .net]} {
+        set cfg(geometry) [wm geometry .net]
+    }
+    mk::view size cfg.main 0
+    foreach {var val} [array get cfg] {
+        mk::row append cfg.main name $var value $val
+    }
+    set bkup roku-[pid].$$$
+    set rc [catch {hvConfigFile create $bkup w} f]
+    if {$rc == 0} {
+        mk::file save cfg $f
+        close $f
+        hvConfigFile delete $cfgfile
+        hvConfigFile rename $bkup $cfgfile
+    } elseif {$top ne ""} {
+        ttk::messageBox -parent $top -message $f -icon error -type ok
+    } else {
+        debug "Failed to save configuration: $f"
+    }
+    return [expr {!$rc}]
+}
+
+# Roku configuration screen
+proc cfg_server {} {
+    global cfg dispactiveapp
+    
+    if {[winfo exists .net]} {
+        wm withdraw .net
+        wm deiconify .net
+        return
+    }
+    ttk::toplevel .net
+    wm withdraw .net
+    wm title .net "Roku Configuration"
+   # wm resizable .net 0 0
+
+    ttk::notebook .net.nb
+
+    ttk::frame .net.nb.fs
+    ttk::frame .net.nb.fs.f1 -relief groove -borderwidth 2
+    ttk::label .net.nb.fs.f1.l1 -text "Roku IP address:" -anchor w
+    ttk::entry .net.nb.fs.f1.e1 -width 20 -justify center -textvariable cfg(rokuIP)
+    ttk::label .net.nb.fs.f1.l2 -text "Roku port number:" -anchor w
+    ttk::entry .net.nb.fs.f1.e2 -width 7 -justify center -textvariable cfg(rokuPort)
+    ttk::label .net.nb.fs.f1.l8 -text "Use discovered Roku IP:" -anchor w
+    ttk::checkbutton .net.nb.fs.f1.c8 -variable cfg(discover) \
+      -command cfg_discover
+    ttk::separator .net.nb.fs.f1.sep
+    ttk::label .net.nb.fs.f1.l9 -text "Netio string:" -anchor w
+    ttk::entry .net.nb.fs.f1.e9 -width 10 -justify center -textvariable cfg(netioType)
+    ttk::label .net.nb.fs.f1.l10 -text "Serial string prefix string:" -anchor w
+    ttk::entry .net.nb.fs.f1.e10 -width 10 -justify center -textvariable cfg(serPre)
+    ttk::label .net.nb.fs.f1.l11 -text "Serial string terminator character(s):" -anchor w
+    ttk::entry .net.nb.fs.f1.e11 -width 5 -justify center -textvariable cfg(serPost)
+    ttk::separator .net.nb.fs.f1.sep2
+    ttk::label .net.nb.fs.f1.l12 -text "MQTT Topic:" -anchor w
+    ttk::entry .net.nb.fs.f1.e12 -width 15 -justify center -textvariable cfg(mqtttopic)
+
+    grid .net.nb.fs.f1.l1 .net.nb.fs.f1.e1   -sticky nws -padx 3
+    grid configure .net.nb.fs.f1.l1      -sticky nes -padx 3
+    grid .net.nb.fs.f1.l2 .net.nb.fs.f1.e2   -sticky nws -padx 3
+    grid configure .net.nb.fs.f1.l2      -sticky nes -padx 3
+    grid .net.nb.fs.f1.l8 .net.nb.fs.f1.c8   -sticky nws -padx 3
+    grid configure .net.nb.fs.f1.l8      -sticky nes -padx 3
+    grid .net.nb.fs.f1.sep -column 0 -columnspan 2 -sticky ew -padx 3 -pady 3
+    grid .net.nb.fs.f1.l9 .net.nb.fs.f1.e9   -sticky nws -padx 3
+    grid configure .net.nb.fs.f1.l9      -sticky nes -padx 3
+    grid .net.nb.fs.f1.l10 .net.nb.fs.f1.e10 -sticky nws -padx 3
+    grid configure .net.nb.fs.f1.l10     -sticky nes -padx 3
+    grid .net.nb.fs.f1.l11 .net.nb.fs.f1.e11 -sticky nws -padx 3
+    grid configure .net.nb.fs.f1.l11     -sticky nes -padx 3
+    grid .net.nb.fs.f1.sep -column 0 -columnspan 2 -sticky ew -padx 3 -pady 3
+    grid .net.nb.fs.f1.l12 .net.nb.fs.f1.e12 -sticky nws -padx 3
+    grid configure .net.nb.fs.f1.l12     -sticky nes -padx 3
+
+    grid columnconfigure .net.nb.fs.f1 1 -weight 1
+    grid .net.nb.fs.f1 -sticky news  -padx 5 -pady 5
+    grid .net.nb.fs    -sticky we    -padx 5 -pady 5 -columnspan 2
+
+    .net.nb add .net.nb.fs -text "Settings" -underline 0
+
+    # Apps tab
+    ttk::frame .net.nb.f1
+    ttk::frame .net.nb.f1.lb -style TEntry -borderwidth 2
+    ttk::treeview .net.nb.f1.lb.l -show {tree headings} -columns {app id} \
+      -displaycolumns {id} -yscrollcommand {.net.nb.f1.lb.s set}
+    set w [font measure TkDefaultFont 0]
+    .net.nb.f1.lb.l column #0 -width [expr {30 * $w}] -stretch 1
+    .net.nb.f1.lb.l heading id -text "ID"
+    .net.nb.f1.lb.l column id -width [expr {15 * $w}] -stretch 1 -anchor center
+    .net.nb.f1.lb.l heading #0 -text "App"
+    .net.nb.f1.lb.l heading app -text "App"
+    .net.nb.f1.lb.l column app -width [expr {15 * $w}] -stretch 1  -anchor center
+    ttk::scrollbar .net.nb.f1.lb.s -command {.net.nb.f1.lb.l yview}
+
+    pack .net.nb.f1.lb.s -side right -fill y
+    pack .net.nb.f1.lb.l -fill both -expand 1
+    ttk::frame .net.nb.f1.fe
+    ttk::label .net.nb.f1.fe.l1 -text "Active App:" 
+    ttk::entry .net.nb.f1.fe.e1 -textvariable dispactiveapp -justify center 
+    .net.nb.f1.fe.e1 configure -state disabled
+
+    ttk::button .net.nb.f1.b1 -text Update -command cfg_apps_update \
+    -image [imglist quickedit] -compound left
+
+    grid .net.nb.f1.fe
+    grid .net.nb.f1.lb  -padx 2 -pady 2 -sticky snew
+    grid .net.nb.f1.fe.l1 .net.nb.f1.fe.e1 -padx 4 -pady 4 
+    grid .net.nb.f1.b1  -padx 4 -pady 4
+#    grid columnconfigure .net.nb.f1.fe 1 -weight 0
+    grid columnconfigure .net.nb.f1.b1 1 -weight 0
+    bind .net.nb.f1.lb.l <<TreeviewSelect>> {set currentItem [lindex [.net.nb.f1.lb.l selection] 0];cfg_devicesel %W}
+    bind .net.nb.f1.lb.l <Double-1> {cfg_device_dbl %W %x %y}
+    grid .net.nb.f1.lb -column 0 -columnspan 2 -sticky news -padx 3
+    grid .net.nb.f1.fe -column 0 -columnspan 2 -sticky news -padx 3
+    grid .net.nb.f1.b1 -column 1 -padx {4 13} -pady {2 8}
+    grid rowconfigure .net.nb.f1 .net.nb.f1.lb -weight 1
+    grid columnconfigure .net.nb.f1 1 -weight 1
+    grid .net.nb.f1 -sticky news  -padx 5 -pady 5
+
+    destroy .rtclkMenu
+    set m [menu .rtclkMenu]
+    $m add command -label "Tune" -command {cfg_rtclkdlg 100}
+    bind .net.nb.f1.lb.l <Button-3> [list cfg_rtclk $m %W %x %y %X %Y]
+
+    # Save changes to column widths. Use unmapped dummy widget to
+    #  capture values before the treeview widget itself is destroyed.
+    ttk::label .net.nb.f1.lb.l.canary
+    bind .net.nb.f1.lb.l.canary <Destroy> bindWidths
+
+    if {[llength [lindex $cfg(listWidths) 0]] == 2} {
+        foreach col {#0 #1} wid [lindex $cfg(listWidths) 0] {
+            .net.nb.f1.lb.l column $col -width $wid
+        }
+    }
+
+    .net.nb add .net.nb.f1 -text Apps -underline 0
+
+    createDevList
+
+    grid .net.nb    -sticky snew    -padx 5 -pady 5 -columnspan 3
+
+    ttk::button .net.b3 -text Done -width 8 -command cfg_done \
+        -image [imglist ok] -compound left
+
+    grid .net.b3  -columnspan 3 -padx {4 13} -pady {2 8}
+    grid columnconfigure .net 2 -weight 1
+    grid columnconfigure .net {0 1} -uniform 1
+
+    bind .net <<NotebookTabChanged>> bindTabs
+    debug "bindtabs:$cfg(listWidths)" red
+    if {[lindex $cfg(listWidths) 1] ne ""} {
+        .net.nb select [lindex $cfg(listWidths) 1]
+    }
+
+    if {[regexp {\+-?[0-9]+\+-?[0-9]+} $cfg(geometry) loc]} {
+        wm geometry .net $loc
+    }
+
+    wm protocol .net WM_DELETE_WINDOW {.net.b3 invoke}
+
+    wm deiconify .net
+    cfg_discover
+}
+
+proc bindWidths {} {
+    global cfg
+    
+    lset cfg(listWidths) 0 [lmap col {#0 #1} {.net.nb.f1.lb.l column $col -width}]
+}
+
+proc bindTabs {} {
+    global cfg
+    
+    lset cfg(listWidths) 1 [.net.nb index current]
+    debug "bindtabs:$cfg(listWidths),[.net.nb index current]" red
+}
+
+# put up Switch/Light item right-click menu
+proc cfg_rtclk {m w x y X Y} {
+    global apps model_id
+
+    set item [$w identify item $x $y]
+    debug "item:$item" red
+    if {![info exists apps]} {return}
+
+    if {$item ne ""} {
+       $m entryconfigure 0 -state normal
+        $w selection set $item
+        tk_popup .rtclkMenu $X $Y
+    }
+}
+
+# process command selected in right-click menu
+proc cfg_rtclkdlg {cmd} {
+    global currentItem cfg
+
+    set win .net.nb.f1.lb.l
+    set currentItem [lindex [$win selection] 0]
+    debug "sel:[$win item $currentItem]" red
+    debug "[lindex [dict get [$win item $currentItem] -values] 1]" green
+    processCmd [lindex [dict get [$win item $currentItem] -values] 1]
+    after cancel {processCmd "active-app"}
+    after 3000 {processCmd "active-app"}
+}
+
+# Get images for Configuration dialog
+proc imglist {i} {
+    global img
+
+    if {![info exists img($i)]} {
+        set img($i) [image create photo \
+            -file [file join [hvVariable ImagePath] $i.png]]
+        set img([format %sdim $i]) [image create photo -format {png -alpha 0.3} \
+            -file [file join [hvVariable ImagePath] $i.png]]
+    }
+    set dim $img([format %sdim $i])
+    return [list $img($i) disabled $dim]
+}
+
+# dummy procs until decide not needed for click/double-click
+proc cfg_devicesel {w} {}
+proc cfg_device_dbl {w x y} {}
+
+proc cfg_apps_update {} {
+
+    processCmd apps
+
+    after cancel {processCmd "active-app"}
+    after 3000 {processCmd active-app}
+}
+
+# Create device list, with updated state
+proc createDevList {} {
+    global apps ids currentItem
+
+    if {[winfo exist .net]} {
+        if {![info exists ids]} {return}
+        set win .net.nb.f1.lb.l
+        $win delete [$win children {}]
+        set i 0
+        foreach {id} [dict keys $ids] {
+            debug "$id:[dict get $ids $id]" blue
+            $win insert {} end -id $id -text [dict get $ids $id] -values [list [dict get $ids $id] $id]
+            incr i
+        }
+        if {$currentItem ne ""} {
+            $win see $currentItem
+        }
+    }
+}
+
+proc cfg_pluginmenu {} {
+    global cfg
+    
+    set str "Roku"
+    # Delete any existing menu entries
+    catch {hvMenu Configure delete $str}
+    catch {hvMenu Help delete $str}
+    if {![catch {hvMenu Main cget Plugins -menu} menu]} {
+        if {![catch {hvMenu $menu index $str} x] && $x ne "none"} {
+            hvMenu $menu delete $x
+            hvMenu Main delete Plugins
+        }
+    }
+    if {![catch {hvMenu Help cget Plugins -menu} help]} {
+        if {![catch {hvMenu $help index $str} x] && $x ne "none"} {
+            hvMenu $help delete $x
+            hvMenu Help delete Plugins
+        }
+    }
+    if {[catch {hvMenu Main cget Plugins -menu} menu]} {
+        set menu Main.plugins
+        hvMenu Main add cascade -label Plugins \
+          -menu $menu -underline 0
+    }
+    hvMenu $menu add command \
+      -label "Roku" -command cfg_server
+
+    if {[hvHelpFile roku.hlp]} {
+        if {[catch {hvMenu Help cget Plugins -menu} menu]} {
+            set menu Help.plugins
+            hvMenu Help add cascade -label Plugins -menu $menu
+        }
+        hvMenu $menu add command -label "Roku" \
+          -command [list hvHelp index]
+    }
+}
+
+proc cfg_discover {} {
+    global cfg
+    if {$cfg(discover)} {
+        .net.nb.fs.f1.e1 state disabled
+        .net.nb.fs.f1.e2 state disabled
+    } else {
+        .net.nb.fs.f1.e1 state !disabled
+        .net.nb.fs.f1.e2 state !disabled
+    }
+}
+
+proc cfg_done {} {
+    global sockChan
+    saveconfig
+    destroy .net
+}
+
+hvPublic rokucb
+proc rokucb {topic payload {retain 0}} {
+
+    debug "Roku: topic:$topic,msg:$payload;" blue
+    processCmd $payload
+
+    after cancel {processCmd "active-app"}
+    after 3000 {processCmd "active-app"}
+}
+
+hvImport mqttComm
+proc subscribe {{type sub}} {
+    global cfg
+
+    debug "subscribe: $type" blue
+    if {$type ni {sub unsub}} {return}
+
+    mqttComm $type <$cfg(mqtttopic)> rokucb
+}
+
+
+hvPublic mqttReady
+proc mqttReady {status} {
+    if {[dict get $status state] eq "connected"} {
+        subscribe
+    }
+}
+
+set gui [hvGuiInit]
+
+loadconfig
+
+if {$gui} {
+    cfg_pluginmenu
+    bind all <Key-KP_Enter> {event generate %W <Key-Return>}
+}
+
+hvTrigger $cfg(serPre) [list rokuserial]
+hvEventHook ready [list subscribe sub]
+hvEventHook exit [list subscribe unsub]
+
+start_search
