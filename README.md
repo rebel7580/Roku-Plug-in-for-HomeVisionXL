@@ -4,7 +4,7 @@
 
 # Overview
 
-The Ruko Client plug-in provides a way to interface Roku devices to HomeVision. Control can be via a serial command (from your HomeVision controller schedule or from other plug-ins), via Netio, or via MQTT, in conjunction with [MQTT Plug-in For HomeVisionXL Version 1.82 or later](https://github.com/rebel7580/MQTT-Plug-in-For-HomeVisionXL). 
+The Roku Client plug-in provides a way to interface Roku devices to HomeVision. Control can be via a serial command (from your HomeVision controller schedule or from other plug-ins), via Netio, or via MQTT, in conjunction with [MQTT Plug-in For HomeVisionXL Version 1.82 or later](https://github.com/rebel7580/MQTT-Plug-in-For-HomeVisionXL). 
 
 # Installing
 
