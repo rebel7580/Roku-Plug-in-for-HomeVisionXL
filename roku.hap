@@ -1,11 +1,11 @@
 # Roku plugin for HomeVision - Ron Boston
 # Version 1.0
-# $Revision: 1.12 $
-# $Date: 2022/01/09 07:06:00 $
+# $Revision: 1.13 $
+# $Date: 2022/01/10 00:41:59 $
 
 hvImport debug
 
-set version {$Id: roku.hap,v 1.12 2022/01/09 07:06:00 ron Exp $}
+set version {$Id: roku.hap,v 1.13 2022/01/10 00:41:59 ron Exp $}
 debug "$version" blue
 
 
@@ -300,7 +300,7 @@ proc getJSON {type} {
             } else {
                 set id "NULL"
             }
-        set json "{\"active-app\":{\"app\":\"$activeapp\",\"id\":$id}}"
+        set json "{\"active-app\":{\"$activeapp\":{\"id\":$id}}}"
 
     } elseif {$type eq "apps"} {
         set json "{\"apps\":{" 
